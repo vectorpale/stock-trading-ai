@@ -1,0 +1,39 @@
+# 环境变量 / Secrets
+.env
+.env.*
+!.env.example
+
+# 数据缓存 / Data cache（只忽略根目录的 data/，不影响 src/data/）
+/data/
+/reports/
+*.parquet
+*.csv.bak
+
+# Python 编译 / Compiled Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# 虚拟环境 / Virtual envs
+venv/
+.venv/
+env/
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Logs
+*.log
+logs/
