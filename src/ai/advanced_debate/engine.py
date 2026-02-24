@@ -76,12 +76,14 @@ class AdvancedDebateEngine:
     - 风险否决机制（FinCon 风险层）
     - 分层记忆注入（FinMem + Reflexion）
     - 置信度加权聚合（TradingAgents 层级加权）
+    - 分角色模型：CIO 使用 Opus，分析师使用 Sonnet，降低成本
     """
 
     def __init__(
         self,
         api_key: str,
-        model: str = 'claude-opus-4-6',
+        model: str = 'claude-sonnet-4-6',           # 分析师默认模型
+        model_cio: str = 'claude-opus-4-6',          # CIO 使用更强模型
         memory: Optional[DecisionMemory] = None,
         convergence_threshold: float = 0.85,
         max_debate_rounds: int = 3,
@@ -89,13 +91,15 @@ class AdvancedDebateEngine:
         """
         Args:
             api_key: Anthropic API Key
-            model: Claude 模型名称
+            model: 各分析师使用的模型（Phase 1/2/3）
+            model_cio: CIO 最终裁决使用的模型（Phase 4，建议 Opus）
             memory: 决策记忆模块（可选，默认创建新实例）
             convergence_threshold: 辩论收敛阈值（超过则停止辩论）
             max_debate_rounds: 最大辩论轮数上限
         """
         self.client = anthropic.Anthropic(api_key=api_key)
-        self.model = model
+        self.model = model              # 分析师模型（Sonnet，性价比高）
+        self.model_cio = model_cio      # CIO 模型（Opus，最强推理）
         self.memory = memory or DecisionMemory()
         self.convergence_threshold = convergence_threshold
         self.max_debate_rounds = max_debate_rounds
@@ -446,7 +450,7 @@ class AdvancedDebateEngine:
 
         try:
             resp = self.client.messages.create(
-                model=self.model,
+                model=self.model_cio,   # CIO 使用更强模型（Opus）
                 max_tokens=1200,
                 system=CIO_SYSTEM_PROMPT,
                 messages=[{"role": "user", "content": prompt}]

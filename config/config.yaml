@@ -57,10 +57,11 @@ fees:
 
 # --- 风险管理 ---
 risk:
-  max_position_size: 0.15         # 单只股票最大仓位（占总资金）
-  max_total_positions: 8          # 最大持仓数量
-  stop_loss_pct: 0.07             # 止损线：跌幅超过7%止损
-  take_profit_pct: 0.20           # 止盈线：涨幅超过20%考虑减仓
+  max_position_size: 0.12         # 单只股票最大仓位（占总资金）—— CIO 受此约束
+  max_total_positions: 10         # 最大持仓数量（集中持仓，建议不超过10）
+  min_cio_confidence: 65          # CIO 最低置信度：低于此值的 BUY 降级为 WATCH
+  stop_loss_pct: 0.07             # 止损线（CIO 未给出时使用此默认值）
+  take_profit_pct: 0.20           # 止盈线（CIO 未给出时使用此默认值）
   max_drawdown_halt: 0.15         # 组合回撤超过15%暂停交易
 
 # --- 策略权重（多策略融合）---
@@ -79,17 +80,36 @@ backtest:
 # --- AI / LLM 设置 ---
 ai:
   enabled: true
-  model: "claude-opus-4-6"        # Claude 模型
+
+  # ── 分角色模型配置（按任务复杂度选择模型，平衡质量与成本）──────────────
+  #
+  # 任务分级：
+  #   高复杂度（CIO 裁决、深度辩论）→ Opus（最强推理）
+  #   中复杂度（各分析师初始分析、辩论轮）→ Sonnet（性价比高）
+  #   低复杂度（新闻情绪摘要、格式化）→ Haiku（最快最便宜）
+  #
+  # 模型 ID 参考（2025）：
+  #   claude-opus-4-6       最强推理，适合 CIO 最终裁决
+  #   claude-sonnet-4-6     高性价比，适合分析师分析
+  #   claude-haiku-4-5-20251001  最快最便宜，适合情绪摘要
+  #
+  model_cio: "claude-opus-4-6"           # CIO 最终裁决（Phase 4）
+  model_analyst: "claude-sonnet-4-6"     # 各分析师分析（Phase 1/2/3）
+  model_sentiment: "claude-haiku-4-5-20251001"  # 新闻情绪摘要（低复杂度）
+
+  # 兼容旧配置：若未指定上述分角色模型，则统一使用此模型
+  model: "claude-sonnet-4-6"
 
   # AI 模式选择:
-  #   debate : 5智能体辩论（多头/空头/量化/宏观/风险官）+ CIO 裁决 [推荐，更准确]
-  #   simple : 单智能体技术分析（速度快，API 费用低）
+  #   debate : 两阶段架构，CIO 全权裁决（量化初筛 + 深度辩论）[推荐]
+  #   simple : 单智能体技术分析（速度快，费用低）
   mode: "debate"
 
-  sentiment_weight: 0.20          # AI 分析在综合信号中的权重（量化80% + AI 20%）
+  sentiment_weight: 0.20          # simple 模式下 AI 权重（debate 模式不使用）
   news_lookback_days: 7           # 分析最近N天新闻
 
   # 辩论引擎参数（mode=debate 时生效）
-  debate_rounds: 1                # 辩论轮数（0=仅初始分析+CIO，1=标准，2+=深度）
+  debate_rounds: 1                # 辩论轮数（0=仅初始+CIO，1=标准，2+=深度）
   convergence_threshold: 0.85     # 收敛阈值：超过则提前停止辩论
   max_debate_rounds: 3            # 最大辩论轮数上限
+  quant_prefilter_threshold: 15   # 量化初筛阈值（低于此分的标的跳过辩论）

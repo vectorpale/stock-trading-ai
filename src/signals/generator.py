@@ -2,11 +2,15 @@
 综合信号生成器
 Comprehensive Signal Generator
 
-融合多策略信号 + AI 情绪分析 → 最终买卖指令
+两阶段架构（debate 模式）：
+  阶段一：量化初筛 — 三个量化策略快速评分，过滤明显无信号的标的
+  阶段二：CIO 全权裁决 — 通过初筛的标的进入多智能体辩论，CIO 作出最终决策
 
-AI 模式选择（通过 config.yaml ai.mode 控制）：
-  - 'debate'  : 5智能体辩论引擎（多头/空头/量化/宏观/风险官 + CIO 裁决）[推荐]
-  - 'simple'  : 单智能体技术分析（原 LLMAnalyzer，速度更快，费用更低）
+CIO 是唯一的权威决策者。量化信号仅作为辩论的数据输入，不参与最终评分的加权。
+
+AI 模式（config.yaml ai.mode）：
+  - 'debate' : 两阶段架构，CIO 全权裁决 [推荐]
+  - 'simple' : 单智能体技术分析（速度快，费用低）
 """
 
 import logging
@@ -29,17 +33,17 @@ logger = logging.getLogger(__name__)
 
 class SignalGenerator:
     """
-    综合交易信号生成器
+    综合交易信号生成器（CIO 全权模式）
 
-    流程：
-    1. 获取股票数据（自动缓存）
-    2. 计算全部技术指标
-    3. 运行三个量化策略（动量/均值回归/多因子）
-    4. AI 分析（两种模式）：
-       - debate 模式：5智能体辩论（多头/空头/量化/宏观/风险官）→ CIO 裁决
-       - simple 模式：单智能体技术分析 + 新闻情绪
-    5. 综合评分 → 最终信号
-    6. 计算仓位建议和止损止盈
+    debate 模式流程：
+    1. 获取数据 + 计算技术指标
+    2. 三个量化策略评分 → 初筛（过滤低分标的，节省 API 调用）
+    3. 通过初筛的标的 → 5智能体辩论 → CIO 全权裁决
+    4. CIO 的 action / score / position_sizing 为最终输出，不再与量化混合
+
+    simple 模式流程：
+    1-2 同上
+    3. 单智能体 LLMAnalyzer 分析（80%量化 + 20% AI 混合）
     """
 
     def __init__(self, config: Dict[str, Any]):
@@ -50,7 +54,7 @@ class SignalGenerator:
 
         self.fetcher = DataFetcher(cache_dir=data_cfg.get('cache_dir', 'data/cache'))
 
-        # 策略权重
+        # 策略权重（量化初筛用）
         weights = config.get('strategy_weights', {})
         self.weights = {
             'momentum': weights.get('momentum', 0.35),
@@ -64,11 +68,18 @@ class SignalGenerator:
         self.sentiment_weight = ai_cfg.get('sentiment_weight', 0.20)
         self.debate_rounds = ai_cfg.get('debate_rounds', 1)
 
+        # 量化初筛阈值：quant_score 低于此值直接跳过辩论（debate 模式专用）
+        # 负值表示"不做初筛，全部进入辩论"
+        self.quant_prefilter_threshold = ai_cfg.get('quant_prefilter_threshold', 15)
+
         # 风险参数
-        self.max_position_size = risk_cfg.get('max_position_size', 0.15)
-        self.max_total_positions = risk_cfg.get('max_total_positions', 8)
+        self.max_position_size = risk_cfg.get('max_position_size', 0.12)
+        self.max_total_positions = risk_cfg.get('max_total_positions', 10)
         self.stop_loss_pct = risk_cfg.get('stop_loss_pct', 0.07)
         self.take_profit_pct = risk_cfg.get('take_profit_pct', 0.20)
+
+        # CIO 最低置信度门槛：低于此值的 BUY 降级为 WATCH
+        self.min_cio_confidence = risk_cfg.get('min_cio_confidence', 65)
 
         # 实例化策略
         self.momentum = MomentumStrategy()
@@ -81,26 +92,39 @@ class SignalGenerator:
         if self.ai_enabled:
             import os
             api_key = os.getenv('ANTHROPIC_API_KEY', '')
-            model = ai_cfg.get('model', 'claude-opus-4-6')
+            # 分角色模型（CIO 用 Opus，分析师用 Sonnet，情绪用 Haiku）
+            model_analyst   = ai_cfg.get('model_analyst',   ai_cfg.get('model', 'claude-sonnet-4-6'))
+            model_cio       = ai_cfg.get('model_cio',       'claude-opus-4-6')
+            model_sentiment = ai_cfg.get('model_sentiment', 'claude-haiku-4-5-20251001')
+
             if self.ai_mode == 'debate':
                 memory_dir = data_cfg.get('memory_dir', 'data/memory')
                 self.debate_engine = AdvancedDebateEngine(
                     api_key=api_key,
-                    model=model,
+                    model=model_analyst,
+                    model_cio=model_cio,
                     memory=DecisionMemory(memory_dir=memory_dir),
                     convergence_threshold=ai_cfg.get('convergence_threshold', 0.85),
                     max_debate_rounds=ai_cfg.get('max_debate_rounds', 3),
                 )
-                logger.info(f"[AI] 多智能体辩论引擎已初始化（{self.debate_rounds} 轮辩论）")
+                # 情绪分析用轻量模型（Haiku）
+                self.llm = LLMAnalyzer(model=model_sentiment)
+                logger.info(
+                    f"[AI] CIO 全权模式已初始化 | "
+                    f"分析师={model_analyst} | CIO={model_cio} | 情绪={model_sentiment} | "
+                    f"辩论轮数={self.debate_rounds} | 初筛阈值={self.quant_prefilter_threshold} | "
+                    f"最低置信度={self.min_cio_confidence}"
+                )
             else:
-                self.llm = LLMAnalyzer(model=model)
-                logger.info("[AI] 单智能体模式已初始化")
+                self.llm = LLMAnalyzer(model=model_analyst)
+                logger.info(f"[AI] 单智能体模式已初始化（model={model_analyst}）")
 
     def generate_for_symbol(
         self,
         symbol: str,
         include_ai: bool = True,
-        capital: float = 100000.0
+        capital: float = 100000.0,
+        skip_prefilter: bool = False,   # 强制跳过初筛，直接进入辩论
     ) -> Dict[str, Any]:
         """
         为单只股票生成完整交易信号
@@ -109,6 +133,7 @@ class SignalGenerator:
             symbol: 股票代码
             include_ai: 是否启用 AI 分析
             capital: 当前可用资金
+            skip_prefilter: True 时跳过量化初筛（用于直接指定的重点标的）
 
         Returns:
             完整的信号字典
@@ -132,7 +157,7 @@ class SignalGenerator:
         latest_indicators = TechnicalIndicators.get_latest_values(df_with_indicators)
         price = float(df['Close'].iloc[-1])
 
-        # ─── 3. 量化策略信号 ───
+        # ─── 3. 量化策略评分（初筛基础）───
         try:
             mom_sig = self.momentum.generate_signal(df_with_indicators, symbol)
             mr_sig = self.mean_reversion.generate_signal(df_with_indicators, symbol)
@@ -147,24 +172,44 @@ class SignalGenerator:
             'multi_factor': mf_sig,
         }
 
-        # ─── 4. 量化综合评分 ───
         quant_score = (
             mom_sig.get('score', 0) * self.weights['momentum'] +
             mr_sig.get('score', 0) * self.weights['mean_reversion'] +
             mf_sig.get('score', 0) * self.weights['multi_factor']
         )
 
+        # ─── 4. 量化初筛（debate 模式）───
+        # 量化评分过低，不值得消耗 API 进行深度辩论 → 直接返回 HOLD
+        if (
+            include_ai
+            and self.ai_mode == 'debate'
+            and not skip_prefilter
+            and self.quant_prefilter_threshold > 0
+            and abs(quant_score) < self.quant_prefilter_threshold
+        ):
+            logger.info(
+                f"  [{symbol}] 量化评分 {quant_score:.1f} 低于初筛阈值 "
+                f"{self.quant_prefilter_threshold}，跳过辩论"
+            )
+            return self._build_quant_only_result(
+                symbol, market, price, quant_score,
+                strategy_signals, latest_indicators, capital,
+                reason='量化评分不足，无需深度辩论'
+            )
+
         # ─── 5. AI 分析 ───
         ai_result = None
         sentiment_result = None
         debate_result = None
         final_score = quant_score
+        action = 'HOLD'
+        confidence = 0.0
 
         if include_ai and self.ai_enabled:
 
             if self.ai_mode == 'debate' and self.debate_engine is not None:
-                # ── 5A. 多智能体辩论模式 ─────────────────────────
-                # 先获取新闻情绪（可选，作为辩论输入）
+                # ── 5A. CIO 全权模式 ─────────────────────────────
+                # 新闻情绪作为辩论输入（可选）
                 try:
                     ticker_info = self.fetcher.fetch_ticker_info(symbol)
                     news = self.fetcher.fetch_news(symbol, max_items=10)
@@ -187,14 +232,34 @@ class SignalGenerator:
                         debate_rounds=self.debate_rounds,
                     )
                     cio = debate_result.get('cio_decision', {})
-                    ai_score = cio.get('score', 0) * self.sentiment_weight
-                    # 融合：量化 80% + 辩论引擎 CIO 20%
-                    final_score = quant_score * (1 - self.sentiment_weight) + ai_score
+
+                    # CIO 全权：直接使用 CIO 的评分，不与量化混合
+                    final_score = float(cio.get('score', quant_score))
+                    action = cio.get('action', 'HOLD')
+                    confidence = float(cio.get('confidence', 0))
+
+                    # 风险委员会 VETO → 强制 HOLD
+                    if debate_result.get('risk_review', {}).get('verdict') == 'VETO':
+                        action = 'HOLD'
+                        confidence = 0.0
+                        logger.info(f"  [{symbol}] 风险委员会否决，强制 HOLD")
+
+                    # CIO 置信度不足 → BUY 降级为 WATCH
+                    elif action == 'BUY' and confidence < self.min_cio_confidence:
+                        logger.info(
+                            f"  [{symbol}] CIO 置信度 {confidence:.0f} < {self.min_cio_confidence}，"
+                            f"BUY 降级为 WATCH"
+                        )
+                        action = 'WATCH'
+
                 except Exception as e:
                     logger.warning(f"{symbol} 多智能体辩论失败: {e}")
+                    # 辩论失败时回退到量化信号
+                    action, confidence = self._score_to_action(quant_score, strategy_signals)
+                    final_score = quant_score
 
             elif self.llm is not None:
-                # ── 5B. 单智能体模式（原 simple 逻辑）────────────
+                # ── 5B. 单智能体模式 ─────────────────────────────
                 try:
                     ticker_info = self.fetcher.fetch_ticker_info(symbol)
                     news = self.fetcher.fetch_news(symbol, max_items=10)
@@ -219,25 +284,16 @@ class SignalGenerator:
                 if sentiment_result:
                     ai_score += sentiment_result.get('sentiment_score', 0) * self.sentiment_weight
                 final_score = quant_score * (1 - self.sentiment_weight) + ai_score
+                action, confidence = self._score_to_action(final_score, strategy_signals)
+
+        else:
+            # AI 未启用 → 纯量化
+            action, confidence = self._score_to_action(quant_score, strategy_signals)
+            final_score = quant_score
 
         final_score = float(np.clip(final_score, -100, 100))
 
-        # ─── 6. 确定最终动作 ───
-        # debate 模式：优先使用 CIO 裁决的 action
-        if debate_result:
-            cio = debate_result.get('cio_decision', {})
-            action = cio.get('action', 'HOLD')
-            confidence = float(cio.get('confidence', 50))
-            # 风险委员会强制 VETO → HOLD
-            if debate_result.get('risk_review', {}).get('verdict') == 'VETO':
-                action = 'HOLD'
-                confidence = 0.0
-        else:
-            action, confidence = self._score_to_action(final_score, strategy_signals)
-
-        # ─── 7. 计算止损止盈 ───
-        atr = latest_indicators.get('atr_14', price * 0.02) or price * 0.02
-        # debate 模式使用风险委员会给出的止损幅度
+        # ─── 6. 止损止盈 ───
         if debate_result:
             cio = debate_result.get('cio_decision', {})
             ps = cio.get('position_sizing', {})
@@ -250,30 +306,32 @@ class SignalGenerator:
         stop_loss = round(price * (1 - stop_loss_pct), 4)
         take_profit = round(price * (1 + take_profit_pct), 4)
 
-        # ─── 8. 仓位建议 ───
+        # ─── 7. 仓位建议（CIO 全权时由 CIO 给出，并受风险委员会约束）───
         position_pct = 0.0
         if action == 'BUY':
             if debate_result:
                 cio = debate_result.get('cio_decision', {})
                 ps = cio.get('position_sizing', {})
-                risk_max = debate_result.get('risk_review', {}).get('max_position_pct', 15)
+                risk_max = debate_result.get('risk_review', {}).get('max_position_pct', 12)
                 suggested = ps.get('suggested_pct', 5)
+                # 三重约束：CIO建议 / 风险委员会上限 / 系统全局上限
                 position_pct = min(suggested, risk_max, self.max_position_size * 100) / 100
             else:
                 position_pct = min(
                     self.max_position_size,
                     0.05 + (final_score - 30) / 700
                 )
+
         position_info = calculate_position_size(
             capital, price, position_pct, self.max_position_size
         )
 
-        # ─── 9. 汇总原因 ───
+        # ─── 8. 汇总原因 ───
         all_reasons = []
         for name, sig in strategy_signals.items():
-            strategy_label = {'momentum': '动量', 'mean_reversion': '均值回归', 'multi_factor': '多因子'}[name]
+            label = {'momentum': '动量', 'mean_reversion': '均值回归', 'multi_factor': '多因子'}[name]
             if sig.get('action') in ('BUY', 'SELL') and sig.get('reason'):
-                all_reasons.append(f"[{strategy_label}] {sig['reason']}")
+                all_reasons.append(f"[{label}] {sig['reason']}")
         if debate_result:
             cio = debate_result.get('cio_decision', {})
             if cio.get('verdict'):
@@ -298,7 +356,6 @@ class SignalGenerator:
             'position_shares': position_info['shares'],
             'position_investment': round(position_info['investment'], 2),
             'reason': '；'.join(all_reasons[:3]),
-
             # 详细分解
             'strategy_signals': strategy_signals,
             'quant_score': round(quant_score, 1),
@@ -306,7 +363,6 @@ class SignalGenerator:
             'ai_analysis': ai_result,
         }
 
-        # debate 模式附加辩论详情
         if debate_result:
             result['debate'] = {
                 'cio_decision': debate_result.get('cio_decision', {}),
@@ -333,28 +389,43 @@ class SignalGenerator:
         symbols: List[str],
         include_ai: bool = True,
         capital: float = 100000.0,
-        max_signals: int = 5
+        max_buy_positions: int = 5,     # 最多返回的 BUY 数量（强集中持仓）
+        max_watch_signals: int = 3,     # 最多返回的 WATCH 数量
     ) -> List[Dict]:
         """
-        批量生成信号并排序
+        两阶段批量分析：量化初筛 → CIO 深度裁决
+
+        debate 模式下，只有通过量化初筛的标的才进入辩论（节省 API）。
+        最终 BUY 信号严格限制在 max_buy_positions 个以内，确保集中持仓。
+
+        Args:
+            symbols: 股票代码列表
+            include_ai: 是否启用 AI
+            capital: 可用资金
+            max_buy_positions: 最终输出的最大 BUY 数量（默认5，对应集中持仓策略）
+            max_watch_signals: 最终输出的最大 WATCH 数量
 
         Returns:
-            按信号强度排序的信号列表（最强的 max_signals 个）
+            [BUY 信号（按置信度排序）] + [SELL 信号] + [WATCH 信号（前N个）]
         """
         all_signals = []
 
         for symbol in symbols:
             try:
-                sig = self.generate_for_symbol(symbol, include_ai=include_ai, capital=capital)
+                sig = self.generate_for_symbol(
+                    symbol, include_ai=include_ai, capital=capital
+                )
                 if sig.get('action') != 'SKIP':
                     all_signals.append(sig)
             except Exception as e:
                 logger.error(f"处理 {symbol} 时出错: {e}")
 
-        # 排序：买入信号按分数降序，卖出信号按分数升序
+        # debate 模式：按 CIO 置信度排序；simple 模式：按 final_score 排序
+        sort_key = 'final_confidence' if self.ai_mode == 'debate' else 'final_score'
+
         buy_signals = sorted(
             [s for s in all_signals if s['action'] == 'BUY'],
-            key=lambda x: x['final_score'], reverse=True
+            key=lambda x: x[sort_key], reverse=True
         )
         sell_signals = sorted(
             [s for s in all_signals if s['action'] == 'SELL'],
@@ -362,18 +433,51 @@ class SignalGenerator:
         )
         watch_signals = sorted(
             [s for s in all_signals if s['action'] == 'WATCH'],
-            key=lambda x: abs(x['final_score']), reverse=True
+            key=lambda x: x[sort_key], reverse=True
         )
-        other_signals = [s for s in all_signals if s['action'] == 'HOLD']
 
-        # 买入信号最多 max_signals 个
-        result = buy_signals[:max_signals] + sell_signals + watch_signals[:3] + other_signals
+        # 严格限制买入数量（集中持仓核心约束）
+        final_buy = buy_signals[:max_buy_positions]
 
         logger.info(
-            f"信号生成完成: {len(buy_signals)} 买入, "
-            f"{len(sell_signals)} 卖出, {len(watch_signals)} 观察"
+            f"信号生成完成: 候选BUY={len(buy_signals)} → 精选BUY={len(final_buy)}, "
+            f"SELL={len(sell_signals)}, WATCH={len(watch_signals)}"
         )
-        return result
+
+        return final_buy + sell_signals + watch_signals[:max_watch_signals]
+
+    def _build_quant_only_result(
+        self,
+        symbol: str,
+        market: str,
+        price: float,
+        quant_score: float,
+        strategy_signals: Dict,
+        indicators: Dict,
+        capital: float,
+        reason: str = '',
+    ) -> Dict[str, Any]:
+        """量化初筛未通过时，返回轻量级 HOLD 结果（不调用 AI）"""
+        atr = indicators.get('atr_14', price * 0.02) or price * 0.02
+        return {
+            'symbol': symbol,
+            'market': market,
+            'generated_at': datetime.now().strftime('%Y-%m-%d %H:%M'),
+            'action': 'HOLD',
+            'final_score': round(quant_score, 1),
+            'final_confidence': round(abs(quant_score) * 0.5, 1),
+            'price': round(price, 4),
+            'stop_loss': round(price - 2 * atr, 4),
+            'take_profit': round(price + 2 * atr, 4),
+            'position_pct': 0.0,
+            'position_shares': 0,
+            'position_investment': 0.0,
+            'reason': reason or '量化评分不足',
+            'strategy_signals': strategy_signals,
+            'quant_score': round(quant_score, 1),
+            'sentiment': None,
+            'ai_analysis': None,
+        }
 
     def _score_to_action(
         self,
@@ -381,11 +485,8 @@ class SignalGenerator:
         strategy_signals: Dict
     ) -> tuple:
         """
-        将综合分数转换为动作
-
-        需要策略信号具有一定的一致性（减少噪声）
+        simple 模式：将综合分数转换为动作（需至少2个策略同向）
         """
-        # 策略一致性检查：至少2个策略同向
         buy_votes = sum(1 for s in strategy_signals.values() if s.get('action') == 'BUY')
         sell_votes = sum(1 for s in strategy_signals.values() if s.get('action') == 'SELL')
 
