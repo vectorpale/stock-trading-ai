@@ -5,12 +5,13 @@ Data Fetcher - Multi-source with automatic fallback
 支持的数据源 / Supported Sources:
   - AkShare  : A股 / 港股 / 美股，国内最稳定，无需 API Key
   - yfinance : 美股 / 港股，速度快但偶有网络限制
-  - BaoStock : A股专用，历史数据完整，免费
+  - Tushare  : A股专用，数据质量高，需设置 TUSHARE_TOKEN 环境变量
+  - BaoStock : A股备用，历史数据完整，免费
 
 市场→优先级 / Market Priority:
   美股 US   : yfinance → akshare_us
   港股 HK   : akshare_hk → yfinance
-  A股 CN    : akshare_cn → baostock
+  A股 CN    : akshare_cn → tushare → baostock
 """
 
 import logging
@@ -206,6 +207,68 @@ def fetch_akshare_cn(symbol: str, period: str, interval: str) -> Optional[pd.Dat
         return None
 
 
+def fetch_tushare(symbol: str, period: str, interval: str) -> Optional[pd.DataFrame]:
+    """
+    Tushare A股日线（数据质量高，需设置 TUSHARE_TOKEN 环境变量）
+
+    注册地址: https://tushare.pro/register
+    设置方式: .env 文件中添加 TUSHARE_TOKEN=your_token
+    """
+    if interval not in ('1d', '1wk', '1mo'):
+        return None
+    try:
+        import os
+        import tushare as ts
+        token = os.getenv('TUSHARE_TOKEN', '')
+        if not token:
+            logger.debug("[tushare] 未设置 TUSHARE_TOKEN，跳过")
+            return None
+
+        ts.set_token(token)
+        pro = ts.pro_api()
+
+        # 代码转换: '600519' → '600519.SH', '000001' → '000001.SZ'
+        sym_clean = symbol.split('.')[0]
+        market = detect_market(symbol)
+        ts_code = f'{sym_clean}.SH' if market == 'CN_SH' else f'{sym_clean}.SZ'
+
+        start, end = period_to_dates(period)
+        freq_map = {'1d': 'D', '1wk': 'W', '1mo': 'M'}
+        freq = freq_map.get(interval, 'D')
+
+        if freq == 'D':
+            df = pro.daily(
+                ts_code=ts_code,
+                start_date=start.strftime('%Y%m%d'),
+                end_date=end.strftime('%Y%m%d')
+            )
+        else:
+            df = pro.weekly(
+                ts_code=ts_code,
+                start_date=start.strftime('%Y%m%d'),
+                end_date=end.strftime('%Y%m%d')
+            ) if freq == 'W' else pro.monthly(
+                ts_code=ts_code,
+                start_date=start.strftime('%Y%m%d'),
+                end_date=end.strftime('%Y%m%d')
+            )
+
+        if df is None or df.empty:
+            return None
+
+        # 列名映射: trade_date, open, high, low, close, vol
+        df = df.rename(columns={
+            'trade_date': 'Date',
+            'open': 'Open', 'high': 'High',
+            'low': 'Low', 'close': 'Close', 'vol': 'Volume',
+        })
+        return normalize_df(df)
+
+    except Exception as e:
+        logger.debug(f"[tushare] {symbol} 失败: {e}")
+        return None
+
+
 # BaoStock 需要登录/注销，用模块级状态管理
 _baostock_session: bool = False
 
@@ -274,8 +337,8 @@ def fetch_baostock(symbol: str, period: str, interval: str) -> Optional[pd.DataF
 _SOURCE_PRIORITY: Dict[str, List[str]] = {
     'US':    ['yfinance', 'akshare_us'],
     'HK':    ['akshare_hk', 'yfinance'],
-    'CN_SH': ['akshare_cn', 'baostock'],
-    'CN_SZ': ['akshare_cn', 'baostock'],
+    'CN_SH': ['akshare_cn', 'tushare', 'baostock'],   # Tushare 作为 AkShare 备用
+    'CN_SZ': ['akshare_cn', 'tushare', 'baostock'],
 }
 
 _FETCH_FN = {
@@ -283,6 +346,7 @@ _FETCH_FN = {
     'akshare_us': fetch_akshare_us,
     'akshare_hk': fetch_akshare_hk,
     'akshare_cn': fetch_akshare_cn,
+    'tushare':    fetch_tushare,
     'baostock':   fetch_baostock,
 }
 

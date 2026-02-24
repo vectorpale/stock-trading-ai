@@ -288,7 +288,7 @@ class BacktestEngine:
         bh_return = (float(price_df['Close'].iloc[-1]) / float(price_df['Close'].iloc[60]) - 1) * 100
         bh_annual = ((1 + bh_return/100) ** (1/n_years) - 1) * 100
 
-        return {
+        metrics = {
             '总收益率(%)': round(total_return, 2),
             '年化收益率(%)': round(annual_return, 2),
             '最大回撤(%)': round(max_drawdown, 2),
@@ -304,3 +304,33 @@ class BacktestEngine:
             '超额收益(%)': round(annual_return - bh_annual, 2),
             '回测天数': n_days,
         }
+
+        # ── empyrical 专业指标（可选，需 pip install empyrical）──
+        try:
+            import empyrical as ep
+            returns = daily_returns  # 已在上面计算
+
+            calmar = ep.calmar_ratio(returns)
+            omega  = ep.omega_ratio(returns)
+            var95  = ep.value_at_risk(returns, cutoff=0.05)
+            cvar95 = ep.conditional_value_at_risk(returns, cutoff=0.05)
+            stability = ep.stability_of_timeseries(returns)
+            tail_ratio = ep.tail_ratio(returns)
+
+            def _fmt(v, pct=False, decimals=3):
+                if v is None or (isinstance(v, float) and np.isnan(v)):
+                    return 'N/A'
+                return round(v * 100 if pct else v, decimals)
+
+            metrics.update({
+                'Calmar比率':    _fmt(calmar),
+                'Omega比率':     _fmt(omega),
+                'VaR(95%, 日%)': _fmt(var95, pct=True, decimals=2),
+                'CVaR(95%, 日%)':_fmt(cvar95, pct=True, decimals=2),
+                '收益稳定性R²':  _fmt(stability),
+                '尾部比率':      _fmt(tail_ratio),
+            })
+        except ImportError:
+            pass  # empyrical 未安装，跳过
+
+        return metrics

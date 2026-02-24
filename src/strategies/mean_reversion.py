@@ -4,6 +4,11 @@ Mean Reversion Strategy
 
 基于布林带、RSI、价格偏离度的均值回归策略
 适合震荡市场，在超买超卖区间操作
+
+优化项（v2）:
+- Z-score 标准化偏离度（比固定百分比更自适应）
+- Hurst 指数过滤（确认标的具有均值回归特性）
+- ADF 平稳性检验（可选，需 statsmodels）
 """
 
 import logging
@@ -28,6 +33,33 @@ class MeanReversionStrategy(BaseStrategy):
     5. KDJ 随机指标辅助确认
     """
 
+    @staticmethod
+    def _hurst_exponent(close_series: pd.Series, max_lag: int = 20) -> float:
+        """
+        Hurst 指数（无需外部库，仅用 numpy）
+        H < 0.45 → 均值回归    H ≈ 0.5 → 随机游走    H > 0.55 → 趋势
+        """
+        ts = close_series.dropna().values
+        if len(ts) < max_lag + 5:
+            return 0.5
+        lags = range(2, max_lag)
+        tau = [float(np.std(ts[lag:] - ts[:-lag])) for lag in lags]
+        tau = [t if t > 0 else 1e-8 for t in tau]
+        reg = np.polyfit(np.log(lags), np.log(tau), 1)
+        return float(reg[0])
+
+    @staticmethod
+    def _zscore(close_series: pd.Series, window: int = 20) -> float:
+        """价格相对滚动均值的 Z-score（标准差倍数）"""
+        if len(close_series) < window:
+            return 0.0
+        recent = close_series.iloc[-window:]
+        mean = recent.mean()
+        std = recent.std()
+        if std == 0:
+            return 0.0
+        return float((close_series.iloc[-1] - mean) / std)
+
     def generate_signal(self, df: pd.DataFrame, symbol: str) -> Dict[str, Any]:
         if df is None or len(df) < 30:
             return self._empty_signal(symbol, "数据不足30日")
@@ -40,6 +72,18 @@ class MeanReversionStrategy(BaseStrategy):
 
         score = 0.0
         reasons = []
+
+        # ─── 0. Hurst 指数：确认均值回归特性 ───
+        hurst = self._hurst_exponent(df['Close'], max_lag=min(20, len(df) // 3))
+        hurst_multiplier = 1.0
+        if hurst < 0.40:
+            hurst_multiplier = 1.3   # 强均值回归特性，加强信号
+            reasons.append(f"Hurst={hurst:.2f}（强均值回归）")
+        elif hurst < 0.48:
+            hurst_multiplier = 1.1
+        elif hurst > 0.60:
+            hurst_multiplier = 0.5   # 趋势型股票，均值回归策略不适用
+            reasons.append(f"Hurst={hurst:.2f}（偏趋势型，信号衰减）")
 
         # ─── 1. 布林带位置 ───
         bb_pct = g(df, 'bb_pct', 0.5) or 0.5   # 0=下轨, 1=上轨
@@ -76,16 +120,35 @@ class MeanReversionStrategy(BaseStrategy):
         if rsi_6 < 20 and rsi > 30:
             score += 15; reasons.append("短期RSI反转信号")
 
-        # ─── 3. 价格偏离均线 ───
-        close_vs_sma20 = g(df, 'close_vs_sma20', 0) or 0
-        close_vs_sma50 = g(df, 'close_vs_sma50', 0) or 0
+        # ─── 3. Z-score 标准化偏离（替代固定百分比，更自适应）───
+        zscore = self._zscore(df['Close'], window=20)
 
-        if close_vs_sma20 < -0.08:
-            score += 20; reasons.append(f"价格低于20日均线{abs(close_vs_sma20)*100:.1f}%")
-        elif close_vs_sma20 < -0.04:
+        if zscore < -2.0:
+            score += 30; reasons.append(f"Z-score={zscore:.2f}（极度低估）")
+        elif zscore < -1.5:
+            score += 20; reasons.append(f"Z-score={zscore:.2f}（明显低估）")
+        elif zscore < -1.0:
             score += 10
-        elif close_vs_sma20 > 0.08:
-            score -= 20; reasons.append(f"价格高于20日均线{close_vs_sma20*100:.1f}%")
+        elif zscore > 2.0:
+            score -= 30; reasons.append(f"Z-score={zscore:.2f}（极度高估）")
+        elif zscore > 1.5:
+            score -= 20; reasons.append(f"Z-score={zscore:.2f}（明显高估）")
+        elif zscore > 1.0:
+            score -= 10
+
+        # ADF 平稳性检验（可选，statsmodels）
+        try:
+            from statsmodels.tsa.stattools import adfuller
+            if len(df) >= 30:
+                adf_result = adfuller(df['Close'].iloc[-60:].dropna(), autolag='AIC')
+                adf_pvalue = adf_result[1]
+                if adf_pvalue < 0.05:
+                    hurst_multiplier = min(hurst_multiplier * 1.15, 1.5)
+                    reasons.append(f"ADF平稳(p={adf_pvalue:.3f})")
+                elif adf_pvalue > 0.5:
+                    hurst_multiplier = max(hurst_multiplier * 0.85, 0.4)
+        except ImportError:
+            pass
 
         # ─── 4. KDJ 随机指标 ───
         stoch_k = g(df, 'stoch_k', 50) or 50
@@ -116,6 +179,9 @@ class MeanReversionStrategy(BaseStrategy):
         if price < sma_200 * 0.95 and score > 0:
             score *= 0.5
             reasons.append("价格低于200日均线（趋势偏弱）")
+
+        # ─── 应用 Hurst 指数调整因子 ───
+        score *= hurst_multiplier
 
         score = np.clip(score, -100, 100)
 

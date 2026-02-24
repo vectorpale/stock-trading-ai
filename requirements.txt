@@ -4,6 +4,7 @@
 # 数据获取
 yfinance>=0.2.36
 akshare>=1.14.0
+tushare>=1.4.0          # A股高质量数据源，需注册 https://tushare.pro 获取 Token
 baostock>=0.8.8
 requests>=2.31.0
 
@@ -26,6 +27,11 @@ streamlit>=1.35.0
 
 # 配置文件解析
 pyyaml>=6.0.1
+
+# 量化金融专用工具（量化研究员工具箱）
+empyrical>=0.5.5        # 专业金融绩效指标：Calmar / Omega / VaR / CVaR
+statsmodels>=0.14.0     # 统计检验：ADF 平稳性检验（均值回归策略）
+vectorbt>=0.26.0        # 向量化快速回测引擎（批量筛选股票）
 
 # 其他工具
 python-dotenv>=1.0.0
