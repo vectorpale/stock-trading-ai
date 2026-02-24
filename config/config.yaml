@@ -26,19 +26,12 @@ market:
     - "1810.HK"   # 小米
     - "2318.HK"   # 中国平安
 
-  # A股标的（沪深，6位数字代码）
-  cn_stocks:
-    - "600519"    # 贵州茅台
-    - "000858"    # 五粮液
-    - "300750"    # 宁德时代
-    - "601318"    # 中国平安
-    - "000001"    # 平安银行
-
 # --- 数据设置 ---
 data:
   lookback_days: 365          # 历史数据回溯天数
   signal_interval: "1d"       # 信号频率: 1d=每日, 30min=半日
   cache_dir: "data/cache"     # 本地数据缓存目录
+  memory_dir: "data/memory"   # 辩论历史记忆存储目录（FinMem 分层记忆）
 
 # --- 富途费率结构（Futu Fee Structure）---
 fees:
@@ -79,13 +72,24 @@ strategy_weights:
 # --- 回测参数 ---
 backtest:
   start_date: "2022-01-01"
-  end_date: "2025-12-31"
+  end_date: "2024-12-31"
   initial_capital: 100000         # 初始资金（USD 或 HKD）
   rebalance_frequency: "weekly"   # 再平衡频率
 
 # --- AI / LLM 设置 ---
 ai:
   enabled: true
-  model: "claude-opus-4-6"        # Claude 模型（最新）
-  sentiment_weight: 0.20          # AI情绪分析在综合信号中的权重
+  model: "claude-opus-4-6"        # Claude 模型
+
+  # AI 模式选择:
+  #   debate : 5智能体辩论（多头/空头/量化/宏观/风险官）+ CIO 裁决 [推荐，更准确]
+  #   simple : 单智能体技术分析（速度快，API 费用低）
+  mode: "debate"
+
+  sentiment_weight: 0.20          # AI 分析在综合信号中的权重（量化80% + AI 20%）
   news_lookback_days: 7           # 分析最近N天新闻
+
+  # 辩论引擎参数（mode=debate 时生效）
+  debate_rounds: 1                # 辩论轮数（0=仅初始分析+CIO，1=标准，2+=深度）
+  convergence_threshold: 0.85     # 收敛阈值：超过则提前停止辩论
+  max_debate_rounds: 3            # 最大辩论轮数上限

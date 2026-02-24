@@ -3,6 +3,10 @@
 Comprehensive Signal Generator
 
 融合多策略信号 + AI 情绪分析 → 最终买卖指令
+
+AI 模式选择（通过 config.yaml ai.mode 控制）：
+  - 'debate'  : 5智能体辩论引擎（多头/空头/量化/宏观/风险官 + CIO 裁决）[推荐]
+  - 'simple'  : 单智能体技术分析（原 LLMAnalyzer，速度更快，费用更低）
 """
 
 import logging
@@ -17,6 +21,7 @@ from ..strategies.momentum import MomentumStrategy
 from ..strategies.mean_reversion import MeanReversionStrategy
 from ..strategies.multi_factor import MultiFactorStrategy
 from ..ai.llm_analyzer import LLMAnalyzer
+from ..ai.advanced_debate import AdvancedDebateEngine, DecisionMemory
 from ..utils.helpers import get_market_type, calculate_position_size
 
 logger = logging.getLogger(__name__)
@@ -30,10 +35,11 @@ class SignalGenerator:
     1. 获取股票数据（自动缓存）
     2. 计算全部技术指标
     3. 运行三个量化策略（动量/均值回归/多因子）
-    4. AI 情绪分析（新闻）
-    5. AI 技术信号解读
-    6. 综合评分 → 最终信号
-    7. 计算仓位建议和止损止盈
+    4. AI 分析（两种模式）：
+       - debate 模式：5智能体辩论（多头/空头/量化/宏观/风险官）→ CIO 裁决
+       - simple 模式：单智能体技术分析 + 新闻情绪
+    5. 综合评分 → 最终信号
+    6. 计算仓位建议和止损止盈
     """
 
     def __init__(self, config: Dict[str, Any]):
@@ -52,9 +58,11 @@ class SignalGenerator:
             'multi_factor': weights.get('multi_factor', 0.40),
         }
 
-        # AI 情绪权重
+        # AI 配置
         self.ai_enabled = ai_cfg.get('enabled', True)
+        self.ai_mode = ai_cfg.get('mode', 'debate')       # 'debate' | 'simple'
         self.sentiment_weight = ai_cfg.get('sentiment_weight', 0.20)
+        self.debate_rounds = ai_cfg.get('debate_rounds', 1)
 
         # 风险参数
         self.max_position_size = risk_cfg.get('max_position_size', 0.15)
@@ -67,11 +75,26 @@ class SignalGenerator:
         self.mean_reversion = MeanReversionStrategy()
         self.multi_factor = MultiFactorStrategy()
 
-        # AI 分析器
+        # AI 分析器（按模式初始化）
+        self.llm = None
+        self.debate_engine = None
         if self.ai_enabled:
-            self.llm = LLMAnalyzer(model=ai_cfg.get('model', 'claude-opus-4-5'))
-        else:
-            self.llm = None
+            import os
+            api_key = os.getenv('ANTHROPIC_API_KEY', '')
+            model = ai_cfg.get('model', 'claude-opus-4-6')
+            if self.ai_mode == 'debate':
+                memory_dir = data_cfg.get('memory_dir', 'data/memory')
+                self.debate_engine = AdvancedDebateEngine(
+                    api_key=api_key,
+                    model=model,
+                    memory=DecisionMemory(memory_dir=memory_dir),
+                    convergence_threshold=ai_cfg.get('convergence_threshold', 0.85),
+                    max_debate_rounds=ai_cfg.get('max_debate_rounds', 3),
+                )
+                logger.info(f"[AI] 多智能体辩论引擎已初始化（{self.debate_rounds} 轮辩论）")
+            else:
+                self.llm = LLMAnalyzer(model=model)
+                logger.info("[AI] 单智能体模式已初始化")
 
     def generate_for_symbol(
         self,
@@ -134,56 +157,113 @@ class SignalGenerator:
         # ─── 5. AI 分析 ───
         ai_result = None
         sentiment_result = None
+        debate_result = None
         final_score = quant_score
 
-        if include_ai and self.llm is not None:
-            # 5a. 新闻情绪分析
-            try:
-                ticker_info = self.fetcher.fetch_ticker_info(symbol)
-                news = self.fetcher.fetch_news(symbol, max_items=10)
-                if news:
-                    sentiment_result = self.llm.analyze_news_sentiment(
-                        symbol, news,
-                        company_name=ticker_info.get('name', symbol)
+        if include_ai and self.ai_enabled:
+
+            if self.ai_mode == 'debate' and self.debate_engine is not None:
+                # ── 5A. 多智能体辩论模式 ─────────────────────────
+                # 先获取新闻情绪（可选，作为辩论输入）
+                try:
+                    ticker_info = self.fetcher.fetch_ticker_info(symbol)
+                    news = self.fetcher.fetch_news(symbol, max_items=10)
+                    if news and self.llm:
+                        sentiment_result = self.llm.analyze_news_sentiment(
+                            symbol, news,
+                            company_name=ticker_info.get('name', symbol)
+                        )
+                except Exception as e:
+                    logger.warning(f"{symbol} 情绪分析失败: {e}")
+
+                try:
+                    debate_result = self.debate_engine.run_debate(
+                        symbol=symbol,
+                        market=market.lower(),
+                        price=price,
+                        strategy_signals=strategy_signals,
+                        indicators=latest_indicators,
+                        sentiment=sentiment_result,
+                        debate_rounds=self.debate_rounds,
                     )
-            except Exception as e:
-                logger.warning(f"{symbol} 情绪分析失败: {e}")
+                    cio = debate_result.get('cio_decision', {})
+                    ai_score = cio.get('score', 0) * self.sentiment_weight
+                    # 融合：量化 80% + 辩论引擎 CIO 20%
+                    final_score = quant_score * (1 - self.sentiment_weight) + ai_score
+                except Exception as e:
+                    logger.warning(f"{symbol} 多智能体辩论失败: {e}")
 
-            # 5b. AI 技术分析
-            try:
-                ai_result = self.llm.analyze_technical_signals(
-                    symbol, strategy_signals, latest_indicators, market
-                )
-            except Exception as e:
-                logger.warning(f"{symbol} AI 技术分析失败: {e}")
+            elif self.llm is not None:
+                # ── 5B. 单智能体模式（原 simple 逻辑）────────────
+                try:
+                    ticker_info = self.fetcher.fetch_ticker_info(symbol)
+                    news = self.fetcher.fetch_news(symbol, max_items=10)
+                    if news:
+                        sentiment_result = self.llm.analyze_news_sentiment(
+                            symbol, news,
+                            company_name=ticker_info.get('name', symbol)
+                        )
+                except Exception as e:
+                    logger.warning(f"{symbol} 情绪分析失败: {e}")
 
-            # 5c. 融合 AI 评分
-            ai_score = 0.0
-            if ai_result:
-                ai_score += ai_result.get('score', 0) * 0.15
-            if sentiment_result:
-                ai_score += sentiment_result.get('sentiment_score', 0) * self.sentiment_weight
+                try:
+                    ai_result = self.llm.analyze_technical_signals(
+                        symbol, strategy_signals, latest_indicators, market
+                    )
+                except Exception as e:
+                    logger.warning(f"{symbol} AI 技术分析失败: {e}")
 
-            # 加权融合（量化80%，AI 20%）
-            final_score = quant_score * (1 - self.sentiment_weight) + ai_score
+                ai_score = 0.0
+                if ai_result:
+                    ai_score += ai_result.get('score', 0) * 0.15
+                if sentiment_result:
+                    ai_score += sentiment_result.get('sentiment_score', 0) * self.sentiment_weight
+                final_score = quant_score * (1 - self.sentiment_weight) + ai_score
 
         final_score = float(np.clip(final_score, -100, 100))
 
         # ─── 6. 确定最终动作 ───
-        action, confidence = self._score_to_action(final_score, strategy_signals)
+        # debate 模式：优先使用 CIO 裁决的 action
+        if debate_result:
+            cio = debate_result.get('cio_decision', {})
+            action = cio.get('action', 'HOLD')
+            confidence = float(cio.get('confidence', 50))
+            # 风险委员会强制 VETO → HOLD
+            if debate_result.get('risk_review', {}).get('verdict') == 'VETO':
+                action = 'HOLD'
+                confidence = 0.0
+        else:
+            action, confidence = self._score_to_action(final_score, strategy_signals)
 
         # ─── 7. 计算止损止盈 ───
         atr = latest_indicators.get('atr_14', price * 0.02) or price * 0.02
-        stop_loss = round(price * (1 - self.stop_loss_pct), 4)
-        take_profit = round(price * (1 + self.take_profit_pct), 4)
+        # debate 模式使用风险委员会给出的止损幅度
+        if debate_result:
+            cio = debate_result.get('cio_decision', {})
+            ps = cio.get('position_sizing', {})
+            stop_loss_pct = ps.get('stop_loss_pct', self.stop_loss_pct)
+            take_profit_pct = ps.get('take_profit_pct', self.take_profit_pct)
+        else:
+            stop_loss_pct = self.stop_loss_pct
+            take_profit_pct = self.take_profit_pct
+
+        stop_loss = round(price * (1 - stop_loss_pct), 4)
+        take_profit = round(price * (1 + take_profit_pct), 4)
 
         # ─── 8. 仓位建议 ───
         position_pct = 0.0
         if action == 'BUY':
-            position_pct = min(
-                self.max_position_size,
-                0.05 + (final_score - 30) / 700
-            )
+            if debate_result:
+                cio = debate_result.get('cio_decision', {})
+                ps = cio.get('position_sizing', {})
+                risk_max = debate_result.get('risk_review', {}).get('max_position_pct', 15)
+                suggested = ps.get('suggested_pct', 5)
+                position_pct = min(suggested, risk_max, self.max_position_size * 100) / 100
+            else:
+                position_pct = min(
+                    self.max_position_size,
+                    0.05 + (final_score - 30) / 700
+                )
         position_info = calculate_position_size(
             capital, price, position_pct, self.max_position_size
         )
@@ -194,10 +274,17 @@ class SignalGenerator:
             strategy_label = {'momentum': '动量', 'mean_reversion': '均值回归', 'multi_factor': '多因子'}[name]
             if sig.get('action') in ('BUY', 'SELL') and sig.get('reason'):
                 all_reasons.append(f"[{strategy_label}] {sig['reason']}")
-        if ai_result and ai_result.get('reasoning'):
+        if debate_result:
+            cio = debate_result.get('cio_decision', {})
+            if cio.get('verdict'):
+                all_reasons.append(f"[CIO] {cio['verdict']}")
+            consensus = debate_result.get('agent_consensus', '')
+            if consensus:
+                all_reasons.append(f"[辩论共识] {consensus}")
+        elif ai_result and ai_result.get('reasoning'):
             all_reasons.append(f"[AI] {ai_result['reasoning'][:80]}...")
 
-        return {
+        result = {
             'symbol': symbol,
             'market': market,
             'generated_at': datetime.now().strftime('%Y-%m-%d %H:%M'),
@@ -218,6 +305,28 @@ class SignalGenerator:
             'sentiment': sentiment_result,
             'ai_analysis': ai_result,
         }
+
+        # debate 模式附加辩论详情
+        if debate_result:
+            result['debate'] = {
+                'cio_decision': debate_result.get('cio_decision', {}),
+                'agent_consensus': debate_result.get('agent_consensus', ''),
+                'convergence_score': debate_result.get('convergence_score', 0),
+                'actual_debate_rounds': debate_result.get('actual_debate_rounds', 0),
+                'risk_review': debate_result.get('risk_review', {}),
+                'agents_summary': {
+                    k: {
+                        'name': v.get('agent_name', k),
+                        'position': v.get('position', '?'),
+                        'score': v.get('score', 0),
+                        'confidence': v.get('confidence', 0),
+                        'core_argument': v.get('core_argument', ''),
+                    }
+                    for k, v in debate_result.get('agents', {}).items()
+                },
+            }
+
+        return result
 
     def generate_for_watchlist(
         self,
