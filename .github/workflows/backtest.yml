@@ -1,0 +1,58 @@
+# ============================================================
+# 策略回测 - GitHub Actions（手动触发）
+# Strategy Backtest - manual trigger only
+# ============================================================
+
+name: 策略回测
+
+on:
+  workflow_dispatch:
+    inputs:
+      symbol:
+        description: '回测股票代码（如 NVDA、0700.HK）'
+        required: true
+        type: string
+      capital:
+        description: '初始资金（USD）'
+        required: false
+        default: '100000'
+        type: string
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python 环境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 安装依赖
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 运行回测
+        run: |
+          echo "============================================================"
+          echo "  策略回测: ${{ github.event.inputs.symbol }}"
+          echo "  初始资金: ${{ github.event.inputs.capital }}"
+          echo "============================================================"
+          python run_signals.py \
+            --backtest ${{ github.event.inputs.symbol }} \
+            --capital ${{ github.event.inputs.capital }} \
+            | tee backtest_output.txt
+
+      - name: 上传回测结果
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtest-${{ github.event.inputs.symbol }}-${{ github.run_number }}
+          path: backtest_output.txt
+          retention-days: 30

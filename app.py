@@ -27,6 +27,7 @@ from src.backtest.fees import FutuFeeCalculator
 from src.strategies.momentum import MomentumStrategy
 from src.strategies.mean_reversion import MeanReversionStrategy
 from src.strategies.multi_factor import MultiFactorStrategy
+from src.portfolio.tracker import PortfolioTracker
 
 # ─── 页面配置 ───
 st.set_page_config(
@@ -635,6 +636,288 @@ def page_fees():
         st.info(f"综合费率：{fees_hk['fee_rate']*100:.4f}% | 往返费率约：{fees_hk['fee_rate']*200:.3f}%")
 
 
+# ─── 页面：模拟交易账户 ───
+def page_portfolio(config):
+    st.header("💼 模拟交易账户")
+    st.caption("$1,000,000 模拟资金 | 根据交易信号自动建仓 | 实时跟踪盈亏")
+
+    cfg = get_config()
+    fetcher = get_fetcher()
+
+    # 初始化组合管理器
+    tracker = PortfolioTracker()
+    fee_calc = FutuFeeCalculator(cfg.get('fees', {}))
+
+    # ─── 获取所有持仓的实时价格 ───
+    current_prices = {}
+    held_symbols = list(tracker.positions.keys())
+    if held_symbols:
+        with st.spinner("获取实时行情..."):
+            for symbol in held_symbols:
+                try:
+                    df = fetcher.fetch_ohlcv(symbol, period="5d", interval="1d", use_cache=True)
+                    if df is not None and not df.empty:
+                        current_prices[symbol] = float(df['Close'].iloc[-1])
+                except Exception:
+                    pass
+
+    # ─── 账户概览 ───
+    summary = tracker.get_account_summary(current_prices)
+
+    # 顶部指标卡片
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("账户总值", f"${summary['total_value']:,.0f}",
+              delta=f"{summary['total_return_pct']:+.2f}%")
+    m2.metric("现金余额", f"${summary['cash']:,.0f}")
+    m3.metric("持仓市值", f"${summary['market_value']:,.0f}")
+    m4.metric("总盈亏", f"${summary['total_pnl']:+,.0f}",
+              delta=f"{summary['total_return_pct']:+.2f}%",
+              delta_color="normal" if summary['total_pnl'] >= 0 else "inverse")
+    m5.metric("持仓数量", f"{summary['positions_count']} 只",
+              delta=f"{summary['winning_positions']} 盈 / {summary['losing_positions']} 亏")
+
+    st.divider()
+
+    # ─── 操作区域 ───
+    op_col1, op_col2 = st.columns(2)
+
+    with op_col1:
+        st.subheader("根据信号自动交易")
+        st.caption("生成交易信号后，一键执行买卖操作")
+
+        # 选择股票池
+        all_us = cfg.get('market', {}).get('us_stocks', [])
+        all_hk = cfg.get('market', {}).get('hk_stocks', [])
+
+        pool_choice = st.selectbox("股票池", [
+            "美股 AI 核心 (10只)",
+            "美股全部",
+            "港股 AI/科技核心 (10只)",
+            "自定义",
+        ], key="portfolio_pool")
+
+        if pool_choice == "美股 AI 核心 (10只)":
+            trade_symbols = ["NVDA", "AMD", "AVGO", "MSFT", "GOOGL", "AMZN", "META", "AAPL", "TSLA", "PLTR"]
+        elif pool_choice == "美股全部":
+            trade_symbols = all_us
+        elif pool_choice == "港股 AI/科技核心 (10只)":
+            trade_symbols = ["0700.HK", "9988.HK", "3690.HK", "1810.HK", "9618.HK",
+                             "0020.HK", "9888.HK", "0981.HK", "1024.HK", "3888.HK"]
+        else:
+            custom_input = st.text_input("输入股票代码（空格分隔）", "NVDA AAPL MSFT", key="portfolio_custom")
+            trade_symbols = [s.strip().upper() for s in custom_input.split() if s.strip()]
+
+        if st.button("生成信号并执行交易", type="primary", key="portfolio_execute"):
+            cfg_copy = dict(cfg)
+            cfg_copy['ai'] = dict(cfg.get('ai', {}))
+            cfg_copy['ai']['enabled'] = False  # 模拟账户用量化信号，更快
+
+            generator = get_signal_generator(cfg_copy)
+
+            with st.spinner(f"正在分析 {len(trade_symbols)} 只股票..."):
+                signals = generator.generate_for_watchlist(
+                    trade_symbols,
+                    include_ai=False,
+                    capital=tracker.cash
+                )
+
+            if signals:
+                # 获取信号中的实时价格
+                sig_prices = {s['symbol']: s['price'] for s in signals if s.get('price', 0) > 0}
+
+                # 执行交易
+                trades = tracker.execute_signals(signals, sig_prices, fee_calc)
+
+                # 更新价格并记录快照
+                current_prices.update(sig_prices)
+                tracker.take_snapshot(current_prices)
+
+                if trades:
+                    st.success(f"执行了 {len(trades)} 笔交易")
+                    for t in trades:
+                        if t['action'] == 'BUY':
+                            st.info(f"买入 {t['symbol']} {t['shares']}股 @ ${t['price']:.2f}")
+                        else:
+                            pnl = t.get('pnl', 0)
+                            st.info(f"卖出 {t['symbol']} {t['shares']}股 @ ${t['price']:.2f}, 盈亏 ${pnl:+,.2f}")
+                else:
+                    buy_sigs = [s for s in signals if s['action'] == 'BUY']
+                    sell_sigs = [s for s in signals if s['action'] == 'SELL']
+                    st.info(f"信号生成完成（BUY: {len(buy_sigs)}, SELL: {len(sell_sigs)}），但无新交易可执行（可能已持有或资金不足）")
+
+                st.rerun()
+            else:
+                st.warning("未能生成信号")
+
+    with op_col2:
+        st.subheader("手动交易")
+        manual_action = st.selectbox("操作", ["买入", "卖出"], key="manual_action")
+        manual_symbol = st.text_input("股票代码", "NVDA", key="manual_symbol").strip().upper()
+        manual_shares = st.number_input("股数", min_value=1, value=100, key="manual_shares")
+
+        if st.button("执行手动交易", key="manual_trade"):
+            # 获取当前价格
+            try:
+                df = fetcher.fetch_ohlcv(manual_symbol, period="5d", interval="1d", use_cache=True)
+                if df is not None and not df.empty:
+                    price = float(df['Close'].iloc[-1])
+                    market = 'hk' if manual_symbol.endswith('.HK') else 'us'
+
+                    if manual_action == "买入":
+                        if market == 'us':
+                            fees = fee_calc.calc_us_fees(manual_shares, price, False)['total']
+                        else:
+                            fees = fee_calc.calc_hk_fees(manual_shares, price, False)['total']
+                        result = tracker.buy(manual_symbol, manual_shares, price, fees, reason="手动买入")
+                    else:
+                        if market == 'us':
+                            fees = fee_calc.calc_us_fees(manual_shares, price, True)['total']
+                        else:
+                            fees = fee_calc.calc_hk_fees(manual_shares, price, True)['total']
+                        result = tracker.sell(manual_symbol, manual_shares, price, fees, reason="手动卖出")
+
+                    if "error" in result:
+                        st.error(result["error"])
+                    else:
+                        st.success(f"{manual_action} {manual_symbol} {manual_shares}股 @ ${price:.2f}")
+                        st.rerun()
+                else:
+                    st.error(f"无法获取 {manual_symbol} 的行情数据")
+            except Exception as e:
+                st.error(f"交易失败: {e}")
+
+        st.divider()
+
+        # 重置账户
+        if st.button("重置账户（清空所有持仓）", key="reset_portfolio", type="secondary"):
+            tracker.reset()
+            st.success("账户已重置为 $1,000,000")
+            st.rerun()
+
+    st.divider()
+
+    # ─── 持仓明细表 ───
+    st.subheader("持仓明细")
+
+    if summary['positions']:
+        positions_data = []
+        for p in summary['positions']:
+            positions_data.append({
+                "股票": p['symbol'],
+                "持股数": p['shares'],
+                "成本价": f"${p['avg_cost']:.2f}",
+                "现价": f"${p['current_price']:.2f}",
+                "投资总成本": f"${p['total_cost']:,.0f}",
+                "当前市值": f"${p['market_value']:,.0f}",
+                "浮动盈亏": f"${p['pnl']:+,.0f}",
+                "收益率": f"{p['pnl_pct']:+.2f}%",
+                "持仓占比": f"{p['weight']:.1f}%",
+                "建仓日期": p['first_buy'],
+            })
+
+        df_positions = pd.DataFrame(positions_data)
+        st.dataframe(df_positions, use_container_width=True, hide_index=True)
+
+        # ─── 持仓分布饼图 ───
+        col_pie, col_bar = st.columns(2)
+
+        with col_pie:
+            labels = [p['symbol'] for p in summary['positions']]
+            values = [p['market_value'] for p in summary['positions']]
+            # 加上现金
+            labels.append("现金")
+            values.append(summary['cash'])
+
+            fig_pie = go.Figure(data=[go.Pie(
+                labels=labels,
+                values=values,
+                hole=0.4,
+                textposition='inside',
+                textinfo='label+percent',
+            )])
+            fig_pie.update_layout(
+                title="资产分布",
+                height=400,
+                template='plotly_dark',
+                showlegend=False,
+            )
+            st.plotly_chart(fig_pie, use_container_width=True)
+
+        with col_bar:
+            # 盈亏柱状图
+            symbols = [p['symbol'] for p in summary['positions']]
+            pnls = [p['pnl'] for p in summary['positions']]
+            colors = ['#00d09c' if v >= 0 else '#ef4444' for v in pnls]
+
+            fig_bar = go.Figure(data=[go.Bar(
+                x=symbols,
+                y=pnls,
+                marker_color=colors,
+                text=[f"${v:+,.0f}" for v in pnls],
+                textposition='outside',
+            )])
+            fig_bar.update_layout(
+                title="各持仓盈亏",
+                yaxis_title="盈亏 ($)",
+                height=400,
+                template='plotly_dark',
+            )
+            st.plotly_chart(fig_bar, use_container_width=True)
+    else:
+        st.info("暂无持仓。点击上方「生成信号并执行交易」开始模拟交易。")
+
+    # ─── 净值曲线 ───
+    snapshots = tracker.daily_snapshots
+    if len(snapshots) > 1:
+        st.subheader("账户净值走势")
+        snap_df = pd.DataFrame(snapshots)
+        fig_equity = go.Figure()
+        fig_equity.add_trace(go.Scatter(
+            x=snap_df['date'],
+            y=snap_df['total_value'],
+            mode='lines+markers',
+            name='账户总值',
+            line=dict(color='#60a5fa', width=2),
+            fill='tozeroy',
+            fillcolor='rgba(96,165,250,0.1)',
+        ))
+        fig_equity.add_hline(
+            y=tracker.data['initial_capital'],
+            line_dash='dash',
+            line_color='#f59e0b',
+            annotation_text='初始资金'
+        )
+        fig_equity.update_layout(
+            yaxis_title="账户价值 ($)",
+            height=350,
+            template='plotly_dark',
+        )
+        st.plotly_chart(fig_equity, use_container_width=True)
+
+    # ─── 交易历史 ───
+    if tracker.trade_history:
+        st.subheader("交易历史")
+        history_data = []
+        for t in reversed(tracker.trade_history[-50:]):  # 最近 50 条
+            row = {
+                "时间": t['date'],
+                "股票": t['symbol'],
+                "操作": "买入" if t['action'] == 'BUY' else "卖出",
+                "股数": t['shares'],
+                "价格": f"${t['price']:.2f}",
+                "金额": f"${t['amount']:,.0f}",
+                "手续费": f"${t['fees']:.2f}",
+                "账户余额": f"${t['cash_after']:,.0f}",
+            }
+            if 'pnl' in t:
+                row["盈亏"] = f"${t['pnl']:+,.0f}"
+            else:
+                row["盈亏"] = "-"
+            history_data.append(row)
+
+        st.dataframe(pd.DataFrame(history_data), use_container_width=True, hide_index=True)
+
+
 # ─── 主入口 ───
 def main():
     # 加载配置
@@ -647,18 +930,21 @@ def main():
     st.title("📈 股票交易策略助手")
     st.caption("美股 & 港股 | 多策略融合 | AI 辅助决策 | 富途平台")
 
-    tabs = st.tabs(["🎯 今日信号", "📊 图表分析", "🔬 策略回测", "💰 费率计算器"])
+    tabs = st.tabs(["🎯 今日信号", "💼 模拟账户", "📊 图表分析", "🔬 策略回测", "💰 费率计算器"])
 
     with tabs[0]:
         page_signals(config, sidebar_params)
 
     with tabs[1]:
-        page_chart(config)
+        page_portfolio(config)
 
     with tabs[2]:
-        page_backtest(config)
+        page_chart(config)
 
     with tabs[3]:
+        page_backtest(config)
+
+    with tabs[4]:
         page_fees()
 
 

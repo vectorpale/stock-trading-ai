@@ -1,0 +1,139 @@
+# ============================================================
+# 每日股票信号 - GitHub Actions
+# Daily Stock Signals - runs before market open
+# ============================================================
+#
+# 自动运行时间（盘前 2 小时生成信号，方便开盘前阅读）：
+#   港股信号：UTC 23:30（北京时间 07:30，港股 09:30 开盘前 2 小时）
+#   美股信号：UTC 12:30（北京时间 20:30，美股 21:30 开盘前 1 小时）
+#   注：美东夏令时 UTC-4 时美股 13:30 开盘，冬令时 UTC-5 时 14:30 开盘
+# 也可在 Actions 页面手动触发，自定义股票和参数
+#
+
+name: 每日股票信号
+
+on:
+  # 定时触发（UTC 时间）
+  schedule:
+    # 港股盘前：周一到周五 UTC 23:30 = 北京时间 07:30（港股 09:30 开盘前 2 小时）
+    - cron: '30 23 * * 0-4'
+    # 美股盘前：周一到周五 UTC 12:30 = 北京时间 20:30（美股开盘前约 1-2 小时）
+    - cron: '30 12 * * 1-5'
+
+  # 手动触发（支持自定义参数）
+  workflow_dispatch:
+    inputs:
+      symbols:
+        description: '股票代码（空格分隔，留空则用配置文件股票池）'
+        required: false
+        default: ''
+        type: string
+      ai_enabled:
+        description: '是否启用 AI 辩论分析'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+      capital:
+        description: '可用资金（USD）'
+        required: false
+        default: '100000'
+        type: string
+
+# 同一时间只运行一个实例，新的触发会取消旧的
+concurrency:
+  group: daily-signals
+  cancel-in-progress: true
+
+jobs:
+  generate-signals:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python 环境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 安装依赖
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 生成交易信号
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          NEWSAPI_KEY: ${{ secrets.NEWSAPI_KEY }}
+          TUSHARE_TOKEN: ${{ secrets.TUSHARE_TOKEN }}
+        run: |
+          # 构建命令参数
+          CMD="python run_signals.py --save"
+
+          # 手动触发时使用自定义股票
+          if [ -n "${{ github.event.inputs.symbols }}" ]; then
+            CMD="$CMD --symbols ${{ github.event.inputs.symbols }}"
+          fi
+
+          # 资金量
+          CAPITAL="${{ github.event.inputs.capital }}"
+          CMD="$CMD --capital ${CAPITAL:-100000}"
+
+          # AI 开关
+          AI_ENABLED="${{ github.event.inputs.ai_enabled }}"
+          if [ "${AI_ENABLED}" != "true" ]; then
+            CMD="$CMD --no-ai"
+          fi
+
+          echo "执行命令: $CMD"
+          $CMD | tee signal_output.txt
+
+      - name: 打印信号到日志
+        if: always()
+        run: |
+          echo "============================================================"
+          echo "  信号生成结果"
+          echo "============================================================"
+          if [ -f signal_output.txt ]; then
+            cat signal_output.txt
+          else
+            echo "未生成输出"
+          fi
+
+      - name: 更新 latest_signals.txt
+        if: success()
+        run: |
+          # 找到最新生成的报告文件
+          LATEST=$(ls -t reports/signals_*.txt 2>/dev/null | head -1)
+          if [ -n "$LATEST" ]; then
+            cp "$LATEST" latest_signals.txt
+            echo "已更新 latest_signals.txt"
+          elif [ -f signal_output.txt ]; then
+            cp signal_output.txt latest_signals.txt
+          fi
+
+      - name: 提交信号结果到仓库
+        if: success()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add latest_signals.txt reports/ 2>/dev/null || true
+          git diff --cached --quiet || git commit -m "signal: $(date '+%Y-%m-%d') 每日信号更新"
+          git push || echo "推送失败（可能无变更）"
+
+      - name: 上传信号报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: signals-${{ github.run_number }}
+          path: |
+            reports/
+            signal_output.txt
+            latest_signals.txt
+          retention-days: 30
